@@ -1,0 +1,1484 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Расписание служений</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=Source+Serif+4:wght@400;600;700&display=swap" rel="stylesheet">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: 'Outfit', sans-serif; background: #F6F5F1; min-height: 100vh; }
+  #root { min-height: 100vh; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<!-- React -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+
+<!-- Firebase -->
+<script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-database-compat.js"></script>
+
+<!-- html2canvas for image export -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
+
+<script>
+// ═══════════════════════════════════════════
+// PASTE YOUR FIREBASE CONFIG HERE
+// ═══════════════════════════════════════════
+const firebaseConfig = {
+  apiKey: "AIzaSyAQPnpk-ZzwPZRxs3BSWmYvV_NIzHmhdYQ",
+  authDomain: "church-schedule-77cae.firebaseapp.com",
+  databaseURL: "https://church-schedule-77cae-default-rtdb.firebaseio.com",
+  projectId: "church-schedule-77cae",
+  storageBucket: "church-schedule-77cae.firebasestorage.app",
+  messagingSenderId: "645474770039",
+  appId: "1:645474770039:web:fdde482d2c4adfe6abba72"
+};
+
+firebase.initializeApp(firebaseConfig);
+</script>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
+<script type="text/babel">
+const { useState, useMemo, useEffect } = React;
+
+/* ═══════════ CONFIG ═══════════ */
+const SERVICES = ["Sunday AM", "Sunday PM", "Thursday"];
+const MAIN_ROLES = ["Host", "Preacher", "Second Preacher", "Third Preacher", "Fourth Preacher", "Usher", "Parking Security"];
+// Decoupled from MAIN_ROLES: Third/Fourth Preacher are slot positions, not volunteer capabilities.
+const ALL_ROLES = ["Host", "Usher", "Preacher", "Second Preacher", "Parking Security", "Communion"];
+const COM_SLOTS = 5;
+
+// Roles per service type (no Usher on Thursday)
+const ROLES_FOR_SERVICE = {
+  "Sunday AM": ["Host", "Preacher", "Second Preacher", "Third Preacher", "Fourth Preacher", "Usher", "Parking Security"],
+  "Sunday PM": ["Host", "Preacher", "Second Preacher", "Third Preacher", "Fourth Preacher", "Usher", "Parking Security"],
+  "Thursday":  ["Host", "Preacher", "Second Preacher", "Third Preacher", "Fourth Preacher", "Parking Security"],
+};
+
+// Russian display names for UI
+const ROLE_LABELS = {
+  Host: "Ведущий",
+  Usher: "Дежурный",
+  Preacher: "Проповедь",
+  "Second Preacher": "2-я Проповедь",
+  "Third Preacher": "3-я Проповедь",
+  "Fourth Preacher": "4-я Проповедь",
+  "Parking Security": "Парковка",
+  Communion: "Вечеря",
+};
+const rl = (role) => ROLE_LABELS[role] || role;
+
+// Optional roles:
+//   - Second Preacher on Thursday only
+//   - Third Preacher and Fourth Preacher on all services
+const isOptionalRole = (role, svc) => {
+  if (role === "Second Preacher" && svc === "Thursday") return true;
+  if (role === "Third Preacher" || role === "Fourth Preacher") return true;
+  return false;
+};
+
+// Map a slot role to the volunteer capability it requires.
+// Third/Fourth Preacher slots are filled from the "Preacher" capability pool.
+const roleCapability = (role) => {
+  if (role === "Third Preacher" || role === "Fourth Preacher") return "Preacher";
+  return role;
+};
+const MONTHS = [
+  "January", "February", "March", "April", "May", "June",
+  "July", "August", "September", "October", "November", "December",
+];
+const DAYNAMES = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
+/* ═══════════ HOLIDAYS ═══════════ */
+const HOLIDAYS = {
+  "2026-01-11": "Крещение Господне / Baptism of Jesus",
+  "2026-03-29": "Вербное воскресенье / Palm Sunday",
+  "2026-04-03": "Страстная пятница / Good Friday",
+  "2026-04-05": "Пасха / Easter Sunday",
+  "2026-05-14": "Вознесение / Ascension Day",
+  "2026-05-24": "Пятидесятница / Pentecost",
+  "2026-05-31": "Троица / Trinity Sunday",
+  "2026-10-04": "Жатва / Harvest Festival",
+  "2026-11-26": "День благодарения / Thanksgiving",
+  "2026-12-24": "Сочельник / Christmas Eve",
+  "2026-12-25": "Рождество / Christmas Day",
+};
+
+/* ═══════════ HELPERS ═══════════ */
+function dateFmt(d) {
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+
+function slotKey(dateStr, svc, role) {
+  return `${dateStr}|${svc}|${role}`;
+}
+
+function comKey(year, month, idx) {
+  return `COM|${year}-${String(month + 1).padStart(2, "0")}|${idx}`;
+}
+
+function getFirstSundayDk(year, month) {
+  for (let d = new Date(year, month, 1); d.getMonth() === month; d.setDate(d.getDate() + 1)) {
+    if (d.getDay() === 0) return dateFmt(d);
+  }
+  return null;
+}
+
+function getServiceDates(year, month) {
+  const result = [];
+  const last = new Date(year, month + 1, 0);
+  for (let d = new Date(year, month, 1); d <= last; d.setDate(d.getDate() + 1)) {
+    const dow = d.getDay();
+    if (dow === 0) {
+      result.push({ dk: dateFmt(d), date: new Date(d), svc: "Sunday AM" });
+      result.push({ dk: dateFmt(d), date: new Date(d), svc: "Sunday PM" });
+    }
+    if (dow === 4) {
+      result.push({ dk: dateFmt(d), date: new Date(d), svc: "Thursday" });
+    }
+  }
+  return result;
+}
+
+function groupByWeek(dates) {
+  const weeks = [];
+  let current = null;
+  for (const sd of dates) {
+    const ws = new Date(sd.date);
+    ws.setDate(ws.getDate() - ws.getDay());
+    const wk = dateFmt(ws);
+    if (!current || current.wk !== wk) {
+      current = { wk, days: {} };
+      weeks.push(current);
+    }
+    if (!current.days[sd.dk]) {
+      current.days[sd.dk] = { date: sd.date, services: [] };
+    }
+    current.days[sd.dk].services.push(sd.svc);
+  }
+  return weeks;
+}
+
+function ordinal(n) {
+  const s = ["th", "st", "nd", "rd"];
+  const v = n % 100;
+  return n + (s[(v - 20) % 10] || s[v] || s[0]);
+}
+
+/* ═══════════ REAL VOLUNTEERS ═══════════ */
+const REAL_VOLS = [
+  { id: "1", name: "Голодняк А.", roles: ["Host", "Usher", "Preacher"], services: ["Sunday AM", "Sunday PM", "Thursday"] },
+  { id: "2", name: "Щербанюк Ю.", roles: ["Host", "Usher", "Preacher"], services: ["Sunday AM", "Sunday PM", "Thursday"] },
+  { id: "3", name: "Гавеловский Г.", roles: ["Host", "Usher", "Communion"], services: ["Sunday AM", "Sunday PM", "Thursday"] },
+  { id: "4", name: "Левко А.", roles: ["Host", "Usher", "Communion", "Parking Security"], services: ["Sunday AM", "Sunday PM", "Thursday"] },
+  { id: "5", name: "Щербанюк Марк", roles: ["Preacher"], services: ["Sunday AM", "Sunday PM", "Thursday"] },
+  { id: "6", name: "Постолаки Н.", roles: ["Host", "Usher", "Parking Security"], services: ["Sunday AM", "Sunday PM", "Thursday"] },
+  { id: "7", name: "Цуркан Д.", roles: ["Host", "Usher", "Preacher", "Communion", "Parking Security"], services: ["Sunday AM", "Sunday PM", "Thursday"] },
+  { id: "8", name: "Мельник С.", roles: ["Host", "Preacher", "Communion", "Parking Security"], services: ["Sunday AM", "Sunday PM", "Thursday"] },
+  { id: "9", name: "Гавеловский М.", roles: ["Preacher"], services: ["Sunday AM", "Sunday PM", "Thursday"] },
+  { id: "10", name: "Гавеловский В.", roles: ["Host", "Usher", "Preacher", "Communion", "Parking Security"], services: ["Sunday AM", "Sunday PM", "Thursday"] },
+  { id: "11", name: "Киоса И.", roles: ["Usher", "Parking Security"], services: ["Sunday AM", "Sunday PM", "Thursday"] },
+  { id: "12", name: "Мельничук А.", roles: ["Usher", "Preacher", "Communion", "Parking Security"], services: ["Sunday AM", "Sunday PM", "Thursday"] },
+  { id: "13", name: "Цуркан П.", roles: ["Communion", "Parking Security"], services: ["Sunday AM", "Sunday PM"] },
+  { id: "14", name: "Блащук Б.", roles: ["Host", "Usher", "Preacher", "Parking Security"], services: ["Sunday AM", "Sunday PM", "Thursday"] },
+  { id: "15", name: "Щербанюк Мариус", roles: ["Communion"], services: ["Sunday AM", "Sunday PM", "Thursday"] },
+  { id: "16", name: "Киоса Илья", roles: ["Communion"], services: ["Sunday AM", "Sunday PM", "Thursday"] },
+  { id: "17", name: "Голодняк Э.", roles: ["Usher"], services: ["Sunday AM", "Sunday PM", "Thursday"] },
+  { id: "18", name: "Гуржий А.", roles: ["Preacher"], services: ["Sunday AM", "Sunday PM", "Thursday"] },
+  { id: "19", name: "Блащук И.", roles: ["Usher"], services: ["Sunday AM", "Sunday PM", "Thursday"] },
+  { id: "20", name: "Линчицкий Вал.", roles: ["Communion", "Parking Security"], services: ["Sunday AM", "Sunday PM"] },
+  { id: "21", name: "Линчицкий Вл.", roles: ["Communion", "Parking Security"], services: ["Sunday AM", "Sunday PM"] },
+  { id: "22", name: "Linchitskaya N.", roles: ["Communion"], services: ["Sunday AM", "Sunday PM"] },
+  { id: "23", name: "Marinov V.V.", roles: ["Communion"], services: ["Sunday AM", "Sunday PM"] },
+  /* ── Parking duty (from Парковка.numbers) ── */
+  { id: "25", name: "Цуркан Роман", roles: ["Parking Security"], services: ["Sunday AM", "Sunday PM", "Thursday"] },
+  { id: "26", name: "Цуркан Сергей", roles: ["Parking Security"], services: ["Sunday AM", "Sunday PM", "Thursday"] },
+  { id: "27", name: "Хомич Вячеслав", roles: ["Parking Security"], services: ["Sunday AM", "Sunday PM", "Thursday"] },
+  { id: "28", name: "Курудимов Анатолий", roles: ["Parking Security"], services: ["Sunday AM", "Sunday PM", "Thursday"] },
+  { id: "29", name: "Гопа Сергей", roles: ["Parking Security"], services: ["Sunday AM", "Sunday PM", "Thursday"] },
+  { id: "30", name: "Вавренюк Владимир", roles: ["Parking Security"], services: ["Sunday AM", "Sunday PM", "Thursday"] },
+  { id: "31", name: "Соник Александр", roles: ["Parking Security"], services: ["Sunday AM", "Sunday PM", "Thursday"] },
+  { id: "32", name: "Цуркан Евгений", roles: ["Parking Security"], services: ["Sunday AM", "Sunday PM", "Thursday"] },
+  { id: "33", name: "Фролов Данила", roles: ["Parking Security"], services: ["Sunday AM", "Sunday PM", "Thursday"] },
+  { id: "34", name: "Чернецкий Славик", roles: ["Parking Security"], services: ["Sunday AM", "Sunday PM", "Thursday"] },
+  { id: "35", name: "Гости", roles: ["Preacher", "Second Preacher"], services: ["Sunday AM", "Sunday PM", "Thursday"] },
+];
+
+/* ═══════════ COLORS ═══════════ */
+const C = {
+  bg: "#F6F5F1", surface: "#FFFFFF", muted: "#ECEBE6",
+  border: "#E0DDD7", borderLt: "#ECEAE5",
+  tx: "#1A1A1A", tx2: "#6B665D", tx3: "#A9A49A",
+  accent: "#2D6A4F", accentSoft: "#E9F3EE",
+  blue: "#3A6FA0", blueSoft: "#EAF1F8",
+  purple: "#7B5EA7", purpleSoft: "#F2EEF8",
+  amber: "#A07D3A", amberSoft: "#F8F2E6",
+  teal: "#3A8C7A", tealSoft: "#E8F5F1",
+  rose: "#9B4D6A", roseSoft: "#F6ECF0",
+  danger: "#C0392B", dangerSoft: "#FDEEEC",
+  hol: "#B8860B", holBg: "#FDF8E8", holBrd: "#E8D48B",
+};
+
+const ROLE_COLORS = {
+  Host: { bg: C.accentSoft, fg: C.accent },
+  Usher: { bg: C.blueSoft, fg: C.blue },
+  Preacher: { bg: C.purpleSoft, fg: C.purple },
+  "Second Preacher": { bg: C.amberSoft, fg: C.amber },
+  "Third Preacher": { bg: C.amberSoft, fg: C.amber },
+  "Fourth Preacher": { bg: C.amberSoft, fg: C.amber },
+  "Parking Security": { bg: C.tealSoft, fg: C.teal },
+  Communion: { bg: C.roseSoft, fg: C.rose },
+};
+
+/* ═══════════ STYLES ═══════════ */
+const globalCSS = `
+@import url('https://fonts.googleapis.com/css2?family=Source+Serif+4:wght@400;600;700&family=Outfit:wght@300;400;500;600;700&display=swap');
+* { box-sizing: border-box; margin: 0; padding: 0; }
+.drag-over {
+  outline: 2px dashed ${C.accent};
+  outline-offset: -2px;
+  background: ${C.accentSoft} !important;
+}
+@media print {
+  .no-print { display: none !important; }
+  .print-break { page-break-inside: avoid; }
+}
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(5px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.fade-in { animation: fadeIn 0.22s ease both; }
+@keyframes modalIn {
+  from { opacity: 0; transform: scale(0.96); }
+  to { opacity: 1; transform: scale(1); }
+}
+.modal-in { animation: modalIn 0.18s ease both; }
+@keyframes shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+.holiday-card {
+  background: linear-gradient(90deg, ${C.holBg} 0%, #FFF8DC 50%, ${C.holBg} 100%);
+  background-size: 200% 100%;
+  animation: shimmer 3s ease-in-out infinite;
+}
+`;
+
+/* ═══════════ UI COMPONENTS ═══════════ */
+function RoleBadge({ role, small }) {
+  const rc = ROLE_COLORS[role] || { bg: C.muted, fg: C.tx2 };
+  return (
+    <span style={{
+      display: "inline-block", padding: small ? "1px 6px" : "2px 8px",
+      borderRadius: 5, fontSize: small ? 10 : 11, fontWeight: 600,
+      background: rc.bg, color: rc.fg, whiteSpace: "nowrap",
+    }}>
+      {rl(role)}
+    </span>
+  );
+}
+
+function Btn({ children, variant = "default", small, style: sx, ...rest }) {
+  const base = {
+    padding: small ? "5px 10px" : "8px 16px", borderRadius: 8, border: "none",
+    cursor: "pointer", fontSize: small ? 12 : 13, fontWeight: 500,
+    fontFamily: "'Outfit', sans-serif", display: "inline-flex", alignItems: "center",
+    gap: 6, transition: "all 0.12s", whiteSpace: "nowrap",
+  };
+  const styles = {
+    primary: { ...base, background: C.accent, color: "#fff" },
+    ghost: { ...base, background: "transparent", color: C.tx2, padding: small ? "4px 8px" : "6px 10px" },
+    default: { ...base, background: C.muted, color: C.tx, border: `1px solid ${C.border}` },
+  };
+  return <button style={{ ...(styles[variant] || styles.default), ...sx }} {...rest}>{children}</button>;
+}
+
+function Card({ children, style: sx, className, isHoliday }) {
+  return (
+    <div
+      className={`${className || ""} ${isHoliday ? "holiday-card" : ""}`}
+      style={{
+        background: isHoliday ? C.holBg : C.surface, borderRadius: 12,
+        border: `1px solid ${isHoliday ? C.holBrd : C.border}`, overflow: "hidden", ...sx,
+      }}
+    >
+      {children}
+    </div>
+  );
+}
+
+/* ═══════════ VOLUNTEER MODAL ═══════════ */
+function VolunteerModal({ volunteer, onSave, onClose }) {
+  const [name, setName] = useState(volunteer?.name || "");
+  const [roles, setRoles] = useState(volunteer?.roles || []);
+  const [services, setServices] = useState(volunteer?.services || [...SERVICES]);
+
+  const toggleRole = (r) => setRoles((p) => p.includes(r) ? p.filter((x) => x !== r) : [...p, r]);
+  const toggleService = (s) => setServices((p) => p.includes(s) ? p.filter((x) => x !== s) : [...p, s]);
+
+  const handleSave = () => {
+    if (!name.trim() || roles.length === 0 || services.length === 0) return;
+    onSave({ id: volunteer?.id || Date.now().toString(), name: name.trim(), roles, services });
+  };
+
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.35)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1000, padding: 20 }} onClick={onClose}>
+      <div className="modal-in" onClick={(e) => e.stopPropagation()} style={{ background: C.surface, borderRadius: 16, width: "100%", maxWidth: 480, maxHeight: "90vh", overflow: "auto", boxShadow: "0 20px 60px rgba(0,0,0,0.15)", fontFamily: "'Outfit', sans-serif" }}>
+        <div style={{ padding: "20px 24px", borderBottom: `1px solid ${C.border}` }}>
+          <h3 style={{ fontSize: 17, fontWeight: 700, fontFamily: "'Source Serif 4', serif" }}>
+            {volunteer?.id ? "Редактировать" : "Добавить"}
+          </h3>
+        </div>
+        <div style={{ padding: 24, display: "flex", flexDirection: "column", gap: 22 }}>
+          <div>
+            <label style={{ fontSize: 12, fontWeight: 600, color: C.tx2, display: "block", marginBottom: 6 }}>Имя</label>
+            <input value={name} onChange={(e) => setName(e.target.value)} placeholder="Введите имя..." autoFocus
+              style={{ padding: "9px 12px", borderRadius: 8, border: `1px solid ${C.border}`, fontSize: 13, fontFamily: "inherit", outline: "none", background: C.surface, color: C.tx, width: "100%", boxSizing: "border-box" }} />
+          </div>
+          <div>
+            <label style={{ fontSize: 12, fontWeight: 600, color: C.tx2, display: "block", marginBottom: 8 }}>Roles</label>
+            <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+              {ALL_ROLES.map((r) => {
+                const active = roles.includes(r);
+                const rc = ROLE_COLORS[r];
+                return (
+                  <button key={r} onClick={() => toggleRole(r)} style={{
+                    padding: "7px 14px", borderRadius: 8,
+                    border: `1.5px solid ${active ? rc.fg + "50" : C.border}`,
+                    cursor: "pointer", fontSize: 13, fontWeight: 500, fontFamily: "inherit",
+                    background: active ? rc.bg : C.surface, color: active ? rc.fg : C.tx3,
+                    transition: "all 0.12s",
+                  }}>{rl(r)}</button>
+                );
+              })}
+            </div>
+          </div>
+          <div>
+            <label style={{ fontSize: 12, fontWeight: 600, color: C.tx2, display: "block", marginBottom: 8 }}>Services</label>
+            <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+              {SERVICES.map((s) => {
+                const active = services.includes(s);
+                return (
+                  <button key={s} onClick={() => toggleService(s)} style={{
+                    padding: "7px 14px", borderRadius: 8,
+                    border: `1.5px solid ${active ? C.accent + "50" : C.border}`,
+                    cursor: "pointer", fontSize: 13, fontWeight: 500, fontFamily: "inherit",
+                    background: active ? C.accentSoft : C.surface, color: active ? C.accent : C.tx3,
+                    transition: "all 0.12s",
+                  }}>{s}</button>
+                );
+              })}
+            </div>
+          </div>
+        </div>
+        <div style={{ padding: "16px 24px", borderTop: `1px solid ${C.border}`, display: "flex", justifyContent: "flex-end", gap: 8 }}>
+          <Btn variant="ghost" onClick={onClose}>Отмена</Btn>
+          <Btn variant="primary" onClick={handleSave} style={{ opacity: name.trim() && roles.length > 0 && services.length > 0 ? 1 : 0.4 }}>
+            {volunteer?.id ? "Сохранить" : "Добавить"}
+          </Btn>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ═══════════ ROLE SLOT ═══════════ */
+function RoleSlot({ dateKey: dk, svc, role, assignments, volunteers, unavailability, onAssign, onClear, canEdit, topics, onTopicChange }) {
+  const key = slotKey(dk, svc, role);
+  const assignedId = assignments[key];
+  const vol = assignedId ? volunteers.find((v) => v.id === assignedId) : null;
+  const [dragOver, setDragOver] = useState(false);
+  const rc = ROLE_COLORS[role] || { bg: C.muted, fg: C.tx2 };
+
+  // For Parking Security and Usher: find who already has it this month (on a different date)
+  const oncePerMonthUsed = useMemo(() => {
+    if (role !== "Parking Security" && role !== "Usher") return new Set();
+    const used = new Set();
+    const suffix = `|${role}`;
+    const monthPrefix = dk.substring(0, 7); // e.g. "2026-03"
+    Object.entries(assignments).forEach(([k, vid]) => {
+      if (vid === "__none__") return;
+      if (!k.startsWith(monthPrefix)) return;
+      if (k.endsWith(suffix) && k !== key) used.add(vid);
+    });
+    return used;
+  }, [assignments, role, key, dk]);
+
+  // Build candidate lists: primary (no conflicts) and secondary (has conflicts but still selectable)
+  const allCandidates = useMemo(() => {
+    const primary = [];
+    const secondary = [];
+    volunteers.forEach((v) => {
+      if (!v.roles.includes(roleCapability(role)) || !v.services.includes(svc)) return;
+      if (unavailability[`${v.id}|${dk}`]) return;
+
+      const flags = [];
+      // Check if already assigned another role on this same service
+      for (const r of MAIN_ROLES) {
+        if (r !== role && assignments[slotKey(dk, svc, r)] === v.id) {
+          flags.push(rl(r));
+        }
+      }
+      // Check once-per-month for Parking/Usher
+      const usedThisMonth = (role === "Parking Security" || role === "Usher") && oncePerMonthUsed.has(v.id);
+      if (usedThisMonth) flags.push("уже в этом месяце");
+
+      if (flags.length === 0) {
+        primary.push(v);
+      } else {
+        secondary.push({ vol: v, flags });
+      }
+    });
+    return { primary, secondary };
+  }, [volunteers, role, svc, dk, unavailability, assignments, oncePerMonthUsed]);
+
+  const isNone = assignedId === "__none__";
+
+  return (
+    <div
+      className={dragOver ? "drag-over" : ""}
+      onDragOver={canEdit ? (e) => { e.preventDefault(); setDragOver(true); } : undefined}
+      onDragLeave={canEdit ? () => setDragOver(false) : undefined}
+      onDrop={canEdit ? (e) => {
+        e.preventDefault(); setDragOver(false);
+        try {
+          const data = JSON.parse(e.dataTransfer.getData("text/plain"));
+          if (data && data.vid) {
+            if (data.fromKey) onClear(data.fromKey);
+            onAssign(key, data.vid);
+          }
+        } catch (err) { /* */ }
+      } : undefined}
+      style={{
+        padding: "5px 8px", borderRadius: 7, minHeight: 36,
+        border: `1px solid ${isNone ? C.borderLt : vol ? rc.fg + "25" : C.borderLt}`,
+        background: isNone ? `${C.muted}60` : vol ? rc.bg + "80" : "rgba(255,255,255,0.7)",
+        transition: "all 0.12s", display: "flex", flexDirection: "column", gap: 2,
+        opacity: isNone ? 0.5 : 1,
+      }}
+    >
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+        <RoleBadge role={role} small />
+        {canEdit && (vol || isNone) && (
+          <button className="no-print" onClick={() => onClear(key)}
+            style={{ background: "none", border: "none", cursor: "pointer", fontSize: 10, color: C.tx3, padding: "0 2px" }}>✕</button>
+        )}
+      </div>
+      {isNone ? (
+        <div style={{ fontSize: 11, fontStyle: "italic", color: C.tx3, padding: "1px 0" }}>— Нет —</div>
+      ) : vol ? (
+        <React.Fragment>
+          <div draggable={canEdit} onDragStart={canEdit ? (e) => e.dataTransfer.setData("text/plain", JSON.stringify({ vid: vol.id, fromKey: key })) : undefined}
+            style={{ fontSize: 12, fontWeight: 600, color: C.tx, cursor: canEdit ? "grab" : "default", padding: "1px 0", userSelect: "none" }}>{vol.name}</div>
+          {role.includes("Preacher") && (
+            canEdit ? (
+              <input
+                className="no-print"
+                value={(topics && topics[key]) || ""}
+                onChange={(e) => onTopicChange(key, e.target.value)}
+                placeholder="Тема..."
+                style={{
+                  fontSize: 10, padding: "2px 6px", borderRadius: 4,
+                  border: `1px solid ${C.borderLt}`, width: "100%",
+                  boxSizing: "border-box", fontFamily: "inherit",
+                  outline: "none", background: "rgba(255,255,255,0.8)", color: C.tx2,
+                }}
+              />
+            ) : (topics && topics[key]) ? (
+              <div style={{ fontSize: 10, color: C.tx2, fontStyle: "italic" }}>{topics[key]}</div>
+            ) : null
+          )}
+        </React.Fragment>
+      ) : canEdit ? (
+        <select className="no-print" value="" onChange={(e) => { if (e.target.value) onAssign(key, e.target.value); }}
+          style={{ fontSize: 11, padding: "3px 6px", borderRadius: 5, border: `1px solid ${C.borderLt}`, color: C.tx3, width: "100%", background: "rgba(255,255,255,0.8)", fontFamily: "inherit", outline: "none", cursor: "pointer" }}>
+          <option value="">Назначить...</option>
+          <option value="__none__">— Нет (не нужно) —</option>
+          {allCandidates.primary.map((v) => (
+            <option key={v.id} value={v.id}>{v.name}</option>
+          ))}
+          {allCandidates.secondary.length > 0 && (
+            <option disabled>── конфликты ──</option>
+          )}
+          {allCandidates.secondary.map(({ vol: v, flags }) => (
+            <option key={v.id} value={v.id}>⚠ {v.name} ({flags.join(", ")})</option>
+          ))}
+        </select>
+      ) : (
+        <div style={{ fontSize: 11, fontStyle: "italic", color: C.tx3, padding: "1px 0" }}>— Не назначено —</div>
+      )}
+    </div>
+  );
+}
+
+/* ═══════════ AUTO FILL ═══════════ */
+function autoFillAll(vols, sdates, unavail, optTog, existAsgn, existCom, year, month) {
+  const asgn = { ...existAsgn };
+  const firstSunDk = getFirstSundayDk(year, month);
+  const comIds = new Set();
+  for (let i = 0; i < COM_SLOTS; i++) {
+    const vid = existCom[comKey(year, month, i)];
+    if (vid) comIds.add(vid);
+  }
+
+  // Track who already has Parking Security or Usher THIS month (from existing assignments)
+  const monthPrefix = `${year}-${String(month + 1).padStart(2, "0")}`;
+  const parkingAssigned = new Set();
+  const usherAssigned = new Set();
+  Object.entries(asgn).forEach(([key, vid]) => {
+    if (vid === "__none__") return;
+    if (!key.startsWith(monthPrefix)) return;
+    if (key.includes("|Parking Security")) parkingAssigned.add(vid);
+    if (key.includes("|Usher")) usherAssigned.add(vid);
+  });
+
+  const countA = (vid) => Object.values(asgn).filter((x) => x === vid && x !== "__none__").length;
+
+  for (const { dk, svc } of sdates) {
+    const rolesForSvc = ROLES_FOR_SERVICE[svc] || MAIN_ROLES;
+    for (const role of rolesForSvc) {
+      if (isOptionalRole(role, svc) && !optTog[`${dk}|${svc}|${role}`]) continue;
+      const key = slotKey(dk, svc, role);
+      if (asgn[key]) continue;
+      const cands = vols.filter((v) => {
+        if (!v.roles.includes(roleCapability(role)) || !v.services.includes(svc)) return false;
+        if (unavail[`${v.id}|${dk}`]) return false;
+        for (const r of MAIN_ROLES) {
+          if (r !== role && asgn[slotKey(dk, svc, r)] === v.id) return false;
+        }
+        if (dk === firstSunDk && svc === "Sunday PM" && comIds.has(v.id)) return false;
+        // Parking Security: once per month only
+        if (role === "Parking Security" && parkingAssigned.has(v.id)) return false;
+        // Usher: once per month only
+        if (role === "Usher" && usherAssigned.has(v.id)) return false;
+        return true;
+      });
+      if (cands.length === 0) continue;
+      cands.sort((a, b) => countA(a.id) - countA(b.id));
+      const min = countA(cands[0].id);
+      const top = cands.filter((v) => countA(v.id) <= min + 1);
+      const picked = top[Math.floor(Math.random() * top.length)];
+      asgn[key] = picked.id;
+      // Track parking and usher assignments
+      if (role === "Parking Security") parkingAssigned.add(picked.id);
+      if (role === "Usher") usherAssigned.add(picked.id);
+    }
+  }
+
+  const comAsgn = { ...existCom };
+  const comVols = vols.filter((v) => v.roles.includes("Communion"));
+  const usedCom = new Set();
+  for (let i = 0; i < COM_SLOTS; i++) {
+    const vid = comAsgn[comKey(year, month, i)];
+    if (vid) usedCom.add(vid);
+  }
+  for (let i = 0; i < COM_SLOTS; i++) {
+    const key = comKey(year, month, i);
+    if (comAsgn[key]) continue;
+    const c2 = comVols.filter((v) => !usedCom.has(v.id));
+    if (c2.length === 0) break;
+    const pick = c2[Math.floor(Math.random() * c2.length)];
+    comAsgn[key] = pick.id;
+    usedCom.add(pick.id);
+  }
+  return { asgn, comAsgn };
+}
+
+/* ═══════════════════════════════════
+   MAIN APP
+   ═══════════════════════════════════ */
+
+/* ═══════════ MARCH 2026 PRE-POPULATED SCHEDULE ═══════════ */
+/* Based on uploaded schedule image. В=Host, Д=Usher, 1=Preacher, 2=Second Preacher */
+/* Volunteer IDs reference REAL_VOLS array above */
+const MARCH_ASGN = {
+  // Mar 1 Sun AM
+  "2026-03-01|Sunday AM|Host": "1",              // Голодняк А.
+  "2026-03-01|Sunday AM|Second Preacher": "14",   // Блащук Б.
+  // Mar 1 Sun PM
+  "2026-03-01|Sunday PM|Host": "3",               // Гавеловский Г.
+  "2026-03-01|Sunday PM|Usher": "12",             // Мельничук А.
+  // Mar 5 Thu
+  "2026-03-05|Thursday|Host": "4",                // Левко А.
+  "2026-03-05|Thursday|Preacher": "35",           // Гости
+  "2026-03-05|Thursday|Second Preacher": "1",     // Голодняк А.
+  // Mar 8 Sun AM
+  "2026-03-08|Sunday AM|Host": "8",               // Мельник С.
+  "2026-03-08|Sunday AM|Usher": "4",              // Левко А.
+  // Mar 8 Sun PM
+  "2026-03-08|Sunday PM|Host": "2",               // Щербанюк Ю.
+  "2026-03-08|Sunday PM|Preacher": "9",           // Гавеловский М.
+  "2026-03-08|Sunday PM|Second Preacher": "7",    // Цуркан Д.
+  // Mar 12 Thu
+  "2026-03-12|Thursday|Host": "6",                // Постолаки Н.
+  "2026-03-12|Thursday|Usher": "14",              // Блащук Б.
+  "2026-03-12|Thursday|Preacher": "35",           // Гости
+  "2026-03-12|Thursday|Second Preacher": "2",     // Щербанюк Ю.
+  // Mar 15 Sun AM
+  "2026-03-15|Sunday AM|Host": "10",              // Гавеловский В.
+  // Mar 15 Sun PM
+  "2026-03-15|Sunday PM|Host": "8",               // Мельник С.
+  "2026-03-15|Sunday PM|Usher": "7",              // Цуркан Д.
+  "2026-03-15|Sunday PM|Second Preacher": "3",    // Гавеловский Г.
+  // Mar 19 Thu
+  "2026-03-19|Thursday|Usher": "10",              // Гавеловский В.
+  "2026-03-19|Thursday|Preacher": "18",           // Гуржий А.
+  "2026-03-19|Thursday|Second Preacher": "1",     // Голодняк А.
+  // Mar 22 Sun AM
+  "2026-03-22|Sunday AM|Host": "7",               // Цуркан Д.
+  // Mar 22 Sun PM
+  "2026-03-22|Sunday PM|Host": "1",               // Голодняк А.
+  "2026-03-22|Sunday PM|Usher": "6",              // Постолаки Н.
+  "2026-03-22|Sunday PM|Preacher": "5",           // Щербанюк Марк
+  "2026-03-22|Sunday PM|Second Preacher": "2",    // Щербанюк Ю.
+  // Mar 26 Thu
+  "2026-03-26|Thursday|Host": "14",               // Блащук Б.
+  // Mar 29 Sun AM
+  "2026-03-29|Sunday AM|Preacher": "35",          // Гости
+  "2026-03-29|Sunday AM|Second Preacher": "2",    // Щербанюк Ю.
+  // Mar 29 Sun PM
+  "2026-03-29|Sunday PM|Host": "1",               // Голодняк А.
+  "2026-03-29|Sunday PM|Usher": "12",             // Мельничук А.
+  "2026-03-29|Sunday PM|Preacher": "10",          // Гавеловский В.
+  "2026-03-29|Sunday PM|Second Preacher": "8",    // Мельник С.
+};
+
+// Enable Second Preacher for services that have one assigned
+const MARCH_OPT = {};
+Object.keys(MARCH_ASGN).forEach((key) => {
+  if (key.includes("Second Preacher")) {
+    const parts = key.split("|");
+    MARCH_OPT[`${parts[0]}|${parts[1]}|Second Preacher`] = true;
+  }
+});
+
+// Communion for March 1st (1-е Воскресенье вечер)
+const MARCH_COM = {
+  "COM|2026-03|0": "7",   // Цуркан Д.
+  "COM|2026-03|1": "4",   // Левко А.
+  "COM|2026-03|2": "3",   // Гавеловский Г.
+  "COM|2026-03|3": "8",   // Мельник С.
+  "COM|2026-03|4": "10",  // Гавеловский В.
+};
+
+/* ═══════════ STORAGE HELPERS ═══════════ */
+const STORAGE_KEY = "church-schedule-data";
+
+// Firebase storage functions
+const dbRef = () => firebase.database().ref(STORAGE_KEY);
+
+async function loadData() {
+  try {
+    const snapshot = await dbRef().once("value");
+    return snapshot.val();
+  } catch (e) {
+    console.error("Failed to load:", e);
+  }
+  return null;
+}
+
+async function saveData(data) {
+  try {
+    await dbRef().set(data);
+  } catch (e) {
+    console.error("Failed to save:", e);
+  }
+}
+
+function PrintContent({ month, year, vols, weeks, asgn, optTog, firstSunDk, firstSunDate, communionPeople, communionNames, singleColumn, topics }) {
+  const sc = singleColumn; // compact alias
+  return (
+    <div>
+      {/* Title */}
+      <div style={{ marginBottom: sc ? 10 : 20, borderBottom: `2px solid ${C.tx}`, paddingBottom: sc ? 6 : 12 }}>
+        <h1 style={{ fontSize: sc ? 16 : 22, fontWeight: 700, fontFamily: "'Source Serif 4', serif", margin: 0 }}>
+          {MONTHS[month]} {year} — Расписание
+        </h1>
+        <p style={{ fontSize: sc ? 10 : 12, color: C.tx2, margin: "2px 0 0" }}>{vols.length} служителей</p>
+      </div>
+      {/* Communion */}
+      <div style={{ marginBottom: sc ? 8 : 16, padding: sc ? "6px 8px" : "10px 14px", borderRadius: 8, border: `1.5px solid ${C.rose}40`, background: `${C.rose}06`, fontSize: sc ? 11 : 13 }}>
+        <span style={{ fontWeight: 700, color: C.rose }}>🍷 Вечеря — 1-е Вскр. вечер{firstSunDate ? ` (${firstSunDate.getDate()} ${MONTHS[month]})` : ""}: </span>
+        <span style={{ fontWeight: 500 }}>
+          {communionPeople.filter(Boolean).map((v) => v.name).join(", ") || "Не назначены"}
+        </span>
+      </div>
+      {/* Schedule grid */}
+      {weeks.map((week, wi) => {
+        const entries = [];
+        Object.values(week.days).forEach(({ date, services }) => {
+          services.forEach((svc) => entries.push({ date, dateKey: dateFmt(date), svc }));
+        });
+        return (
+          <div key={week.wk} style={{ marginBottom: sc ? 8 : 18 }}>
+            <div style={{ fontSize: sc ? 9 : 11, fontWeight: 700, color: C.tx3, textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: sc ? 3 : 6 }}>
+              Неделя {wi + 1}
+            </div>
+            <div style={{ display: "grid", gridTemplateColumns: sc ? "1fr" : `repeat(${Math.min(entries.length, 3)}, 1fr)`, gap: sc ? 4 : 8 }}>
+              {entries.map(({ date, dateKey: d, svc }) => {
+                const holiday = HOLIDAYS[d];
+                const rolesForSvc = ROLES_FOR_SERVICE[svc] || MAIN_ROLES;
+                const isCom = d === firstSunDk && svc === "Sunday PM";
+                return (
+                  <div key={`${d}-${svc}`} style={{ border: `1px solid ${C.border}`, borderRadius: sc ? 6 : 10, overflow: "hidden", background: holiday ? C.holBg : "#fff", fontSize: sc ? 11 : 12 }}>
+                    <div style={{ fontWeight: 700, fontSize: sc ? 11 : 13, padding: sc ? "4px 8px" : "8px 12px", display: "flex", alignItems: "center", gap: sc ? 4 : 6, background: holiday ? `${C.hol}0C` : C.bg, borderBottom: `1px solid ${C.border}` }}>
+                      <span style={{ fontSize: sc ? 13 : 16 }}>{date.getDate()}</span>
+                      <span style={{ fontWeight: 500, color: C.tx2 }}>{svc}</span>
+                      {holiday && <span style={{ fontSize: sc ? 8 : 10, color: C.hol, fontWeight: 600 }}>✝ {holiday}</span>}
+                      {isCom && <span style={{ fontSize: sc ? 8 : 10, color: C.rose, fontWeight: 700 }}>🍷 Вечеря</span>}
+                    </div>
+                    <div style={{ padding: sc ? "3px 4px" : "6px 8px", display: "flex", flexDirection: "column", gap: sc ? 2 : 4 }}>
+                      {rolesForSvc.map((role) => {
+                        if (isOptionalRole(role, svc) && !optTog[`${d}|${svc}|${role}`]) return null;
+                        const vid = asgn[slotKey(d, svc, role)];
+                        const person = vid && vid !== "__none__" ? vols.find((v) => v.id === vid) : null;
+                        const isNoneVal = vid === "__none__";
+                        const rc = ROLE_COLORS[role] || { bg: C.muted, fg: C.tx2 };
+                        return (
+                          <div key={role} style={{
+                            display: "flex", alignItems: "center", gap: sc ? 4 : 8,
+                            padding: sc ? "2px 6px" : "5px 10px", borderRadius: sc ? 4 : 7,
+                            background: isNoneVal ? C.muted + "40" : person ? rc.bg : C.dangerSoft + "60",
+                            border: `1px solid ${isNoneVal ? C.borderLt : person ? rc.fg + "20" : C.danger + "25"}`,
+                          }}>
+                            <span style={{
+                              fontSize: sc ? 9 : 10, fontWeight: 700, color: rc.fg,
+                              minWidth: sc ? 65 : 85, whiteSpace: "nowrap",
+                            }}>{rl(role)}</span>
+                            <span style={{
+                              fontSize: sc ? 11 : 12, fontWeight: 600,
+                              color: isNoneVal ? C.tx3 : person ? C.tx : C.danger,
+                              fontStyle: isNoneVal ? "italic" : "normal",
+                            }}>
+                              {isNoneVal ? "—" : person ? person.name : "⚠ Пусто"}
+                            </span>
+                            {role.includes("Preacher") && topics && topics[slotKey(d, svc, role)] && (
+                              <span style={{ fontSize: sc ? 8 : 10, color: C.tx2, fontStyle: "italic" }}>
+                                — {topics[slotKey(d, svc, role)]}
+                              </span>
+                            )}
+                          </div>
+                        );
+                      })}
+                      {isCom && communionNames.length > 0 && (
+                        <div style={{
+                          display: "flex", alignItems: "center", gap: sc ? 4 : 8,
+                          padding: sc ? "2px 6px" : "5px 10px", borderRadius: sc ? 4 : 7,
+                          background: C.roseSoft, border: `1px solid ${C.rose}20`,
+                        }}>
+                          <span style={{ fontSize: sc ? 9 : 10, fontWeight: 700, color: C.rose, minWidth: sc ? 65 : 85 }}>🍷 Вечеря</span>
+                          <span style={{ fontSize: sc ? 11 : 12, fontWeight: 600, color: C.tx }}>
+                            {communionPeople.filter(Boolean).map((v) => v.name).join(", ")}
+                          </span>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function ChurchScheduleBuilder() {
+  const [view, setView] = useState("schedule");
+  const [vols, setVols] = useState(REAL_VOLS);
+  const [asgn, setAsgn] = useState(MARCH_ASGN);
+  const [comAsgn, setComAsgn] = useState(MARCH_COM);
+  const [optTog, setOptTog] = useState(MARCH_OPT);
+  const [unavail, setUnavail] = useState({});
+  const [topics, setTopics] = useState({});
+  const [month, setMonth] = useState(2); // March
+  const [year, setYear] = useState(2026);
+  const [showModal, setShowModal] = useState(false);
+  const [editVol, setEditVol] = useState(null);
+  const [initialized, setInitialized] = useState(true);
+  const [loaded, setLoaded] = useState(false);
+  const [saveStatus, setSaveStatus] = useState("");
+
+  // ── Access Control ──
+  const EDIT_KEY_PARAM = "edit";
+  const SESSION_KEY = "church-schedule-edit-mode";
+
+  const [editVerified, setEditVerified] = useState(false);
+  const [showPinDialog, setShowPinDialog] = useState(false);
+  const [pinInput, setPinInput] = useState("");
+  const [pinError, setPinError] = useState(false);
+  const editKeyFromDb = React.useRef(null);
+
+  useEffect(() => {
+    const configRef = firebase.database().ref("church-schedule-config/editKey");
+    configRef.once("value").then((snap) => {
+      const dbKey = snap.val();
+      editKeyFromDb.current = dbKey;
+      // Check URL parameter
+      const params = new URLSearchParams(window.location.search);
+      const urlKey = params.get(EDIT_KEY_PARAM);
+      // Check sessionStorage
+      const sessionKey = sessionStorage.getItem(SESSION_KEY);
+      const candidateKey = urlKey || sessionKey;
+      if (candidateKey && dbKey && candidateKey === dbKey) {
+        setEditVerified(true);
+        sessionStorage.setItem(SESSION_KEY, candidateKey);
+        // Clean URL
+        if (urlKey) {
+          const url = new URL(window.location);
+          url.searchParams.delete(EDIT_KEY_PARAM);
+          window.history.replaceState({}, "", url.toString());
+        }
+      }
+    });
+  }, []);
+
+  const canEdit = editVerified;
+
+  const handlePinSubmit = () => {
+    if (pinInput && editKeyFromDb.current && pinInput === editKeyFromDb.current) {
+      setEditVerified(true);
+      sessionStorage.setItem(SESSION_KEY, pinInput);
+      setShowPinDialog(false);
+      setPinInput("");
+      setPinError(false);
+    } else {
+      setPinError(true);
+    }
+  };
+
+  // ── Load from persistent storage on mount ──
+  // ── Real-time sync with Firebase ──
+  const skipNextSave = React.useRef(false);
+
+  useEffect(() => {
+    const ref = dbRef();
+    const unsubscribe = ref.on("value", (snapshot) => {
+      const data = snapshot.val();
+      if (!data) { setLoaded(true); return; }
+      skipNextSave.current = true;
+      if (data.vols) setVols(data.vols);
+      if (data.asgn) setAsgn(data.asgn);
+      if (data.comAsgn) setComAsgn(data.comAsgn);
+      if (data.optTog) setOptTog(data.optTog);
+      if (data.unavail) setUnavail(data.unavail);
+      if (data.topics) setTopics(data.topics);
+      setInitialized(true);
+      setLoaded(true);
+      setTimeout(() => { skipNextSave.current = false; }, 100);
+    });
+    return () => ref.off("value", unsubscribe);
+  }, []);
+
+  // ── Save to Firebase whenever data changes (admin only for schedule data) ──
+  useEffect(() => {
+    if (!loaded) return;
+    if (skipNextSave.current) return;
+    if (!canEdit) return;
+    const timer = setTimeout(() => {
+      saveData({ vols, asgn, comAsgn, optTog, unavail, topics }).then(() => {
+        setSaveStatus("saved");
+        setTimeout(() => setSaveStatus(""), 2000);
+      });
+    }, 500);
+    return () => clearTimeout(timer);
+  }, [vols, asgn, comAsgn, optTog, topics, loaded, canEdit]);
+
+  // ── Save availability changes (allowed for all users) ──
+  const skipNextAvailSave = React.useRef(false);
+  useEffect(() => {
+    if (!loaded) return;
+    if (skipNextSave.current) return;
+    if (skipNextAvailSave.current) { skipNextAvailSave.current = false; return; }
+    if (canEdit) return; // admin saves unavail via the main save above
+    const timer = setTimeout(() => {
+      dbRef().child("unavail").set(unavail).then(() => {
+        setSaveStatus("saved");
+        setTimeout(() => setSaveStatus(""), 2000);
+      });
+    }, 500);
+    return () => clearTimeout(timer);
+  }, [unavail, loaded, canEdit]);
+
+  // ── Reset all data ──
+  const handleResetAll = async () => {
+    if (!confirm("Сбросить все данные? Все изменения будут удалены.")) return;
+    try { await dbRef().remove(); } catch (e) { /* ok */ }
+    setVols(REAL_VOLS);
+    setAsgn(MARCH_ASGN);
+    setComAsgn(MARCH_COM);
+    setOptTog(MARCH_OPT);
+    setUnavail({});
+    setInitialized(true);
+  };
+
+  const serviceDates = useMemo(() => getServiceDates(year, month), [year, month]);
+  const weeks = useMemo(() => groupByWeek(serviceDates), [serviceDates]);
+  const firstSunDk = useMemo(() => getFirstSundayDk(year, month), [year, month]);
+
+  const uniqueDates = useMemo(() => {
+    const seen = new Set();
+    return serviceDates.filter((d) => { if (seen.has(d.dk)) return false; seen.add(d.dk); return true; });
+  }, [serviceDates]);
+
+  const holidaysThisMonth = useMemo(() => {
+    const result = [];
+    const last = new Date(year, month + 1, 0);
+    for (let d = new Date(year, month, 1); d <= last; d.setDate(d.getDate() + 1)) {
+      const name = HOLIDAYS[dateFmt(d)];
+      if (name) result.push({ dk: dateFmt(d), name, date: new Date(d) });
+    }
+    return result;
+  }, [year, month]);
+
+  const communionPeople = useMemo(() => {
+    const people = [];
+    for (let i = 0; i < COM_SLOTS; i++) {
+      const vid = comAsgn[comKey(year, month, i)];
+      people.push(vid ? vols.find((v) => v.id === vid) || null : null);
+    }
+    return people;
+  }, [comAsgn, year, month, vols]);
+
+  const communionNames = useMemo(() => communionPeople.filter(Boolean).map((v) => v.name), [communionPeople]);
+
+  const firstSunDate = useMemo(() => {
+    if (!firstSunDk) return null;
+    const p = firstSunDk.split("-");
+    return new Date(+p[0], +p[1] - 1, +p[2]);
+  }, [firstSunDk]);
+
+  // Auto-fill only on first load when no saved data exists
+  useEffect(() => {
+    if (!loaded) return;
+    if (!initialized && vols.length > 0 && serviceDates.length > 0) {
+      const result = autoFillAll(vols, serviceDates, unavail, optTog, {}, {}, year, month);
+      setAsgn(result.asgn);
+      setComAsgn(result.comAsgn);
+      setInitialized(true);
+    }
+  }, [initialized, loaded, vols, serviceDates, unavail, optTog, year, month]);
+
+  const prevMonth = () => { if (month === 0) { setMonth(11); setYear((y) => y - 1); } else setMonth((m) => m - 1); };
+  const nextMonth = () => { if (month === 11) { setMonth(0); setYear((y) => y + 1); } else setMonth((m) => m + 1); };
+
+  const isOptEnabled = (dk, svc, role) => !!optTog[`${dk}|${svc}|${role}`];
+  const toggleOptional = (dk, svc, role) => {
+    const key = `${dk}|${svc}|${role}`;
+    setOptTog((p) => ({ ...p, [key]: !p[key] }));
+    if (optTog[key]) setAsgn((p) => { const n = { ...p }; delete n[slotKey(dk, svc, role)]; return n; });
+  };
+
+  const saveVolunteer = (v) => {
+    setVols((prev) => { const idx = prev.findIndex((x) => x.id === v.id); if (idx >= 0) { const n = [...prev]; n[idx] = v; return n; } return [...prev, v]; });
+    setShowModal(false); setEditVol(null);
+  };
+
+  const deleteVolunteer = (id) => {
+    setVols((p) => p.filter((v) => v.id !== id));
+    setAsgn((p) => { const n = { ...p }; Object.keys(n).forEach((k) => { if (n[k] === id) delete n[k]; }); return n; });
+    setComAsgn((p) => { const n = { ...p }; Object.keys(n).forEach((k) => { if (n[k] === id) delete n[k]; }); return n; });
+  };
+
+  const onAssign = (key, vid) => setAsgn((p) => ({ ...p, [key]: vid }));
+  const onClear = (key) => {
+    setAsgn((p) => { const n = { ...p }; delete n[key]; return n; });
+    setTopics((p) => { const n = { ...p }; delete n[key]; return n; });
+  };
+  const onTopicChange = (key, text) => setTopics((p) => {
+    if (!text) { const n = { ...p }; delete n[key]; return n; }
+    return { ...p, [key]: text };
+  });
+  const onComAssign = (idx, vid) => setComAsgn((p) => ({ ...p, [comKey(year, month, idx)]: vid }));
+  const onComClear = (idx) => setComAsgn((p) => { const n = { ...p }; delete n[comKey(year, month, idx)]; return n; });
+
+  const handleAutoFill = () => {
+    const result = autoFillAll(vols, serviceDates, unavail, optTog, asgn, comAsgn, year, month);
+    setAsgn(result.asgn); setComAsgn(result.comAsgn);
+  };
+
+  const handleClearMonth = () => {
+    const na = { ...asgn };
+    const nc = { ...comAsgn };
+    serviceDates.forEach(({ dk, svc }) => { MAIN_ROLES.forEach((r) => { delete na[slotKey(dk, svc, r)]; }); });
+    for (let i = 0; i < COM_SLOTS; i++) delete nc[comKey(year, month, i)];
+    setAsgn(na); setComAsgn(nc);
+  };
+
+  const [printView, setPrintView] = useState(false);
+  const [exporting, setExporting] = useState(false);
+  const exportRef = React.useRef(null);
+
+  useEffect(() => {
+    if (!exporting || !exportRef.current) return;
+    html2canvas(exportRef.current, { scale: 4, useCORS: true, backgroundColor: "#fff" })
+      .then((canvas) => {
+        const link = document.createElement("a");
+        link.download = `schedule-${year}-${String(month + 1).padStart(2, "0")}.png`;
+        link.href = canvas.toDataURL("image/png");
+        link.click();
+      })
+      .catch((e) => {
+        alert("Ошибка при создании изображения");
+        console.error(e);
+      })
+      .finally(() => setExporting(false));
+  }, [exporting]);
+
+  const handleExportImage = () => setExporting(true);
+
+  const handleExport = () => {
+    const data = {
+      month: MONTHS[month],
+      year,
+      volunteers: vols.reduce((acc, v) => { acc[v.id] = v.name; return acc; }, {}),
+      assignments: {},
+      communion: {},
+    };
+    // Only include assignments for current month
+    serviceDates.forEach(({ dk, svc }) => {
+      (ROLES_FOR_SERVICE[svc] || MAIN_ROLES).forEach((role) => {
+        const key = slotKey(dk, svc, role);
+        const vid = asgn[key];
+        if (vid && vid !== "__none__") {
+          const vol = vols.find((v) => v.id === vid);
+          data.assignments[key] = { id: vid, name: vol ? vol.name : vid };
+          if (topics[key]) data.assignments[key].topic = topics[key];
+        } else if (vid === "__none__") {
+          data.assignments[key] = { id: "__none__", name: "—" };
+        }
+      });
+    });
+    for (let i = 0; i < COM_SLOTS; i++) {
+      const key = comKey(year, month, i);
+      const vid = comAsgn[key];
+      if (vid) {
+        const vol = vols.find((v) => v.id === vid);
+        data.communion[i] = { id: vid, name: vol ? vol.name : vid };
+      }
+    }
+    const json = JSON.stringify(data, null, 2);
+    const blob = new Blob([json], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `schedule-${year}-${String(month + 1).padStart(2, "0")}.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  const volCounts = useMemo(() => {
+    const ct = {};
+    vols.forEach((v) => { ct[v.id] = 0; });
+    Object.values(asgn).forEach((vid) => { if (vid !== "__none__" && ct[vid] !== undefined) ct[vid]++; });
+    Object.values(comAsgn).forEach((vid) => { if (vid !== "__none__" && ct[vid] !== undefined) ct[vid]++; });
+    return ct;
+  }, [asgn, comAsgn, vols]);
+
+  const getComAvailable = (slotIdx) => {
+    const used = new Set();
+    for (let i = 0; i < COM_SLOTS; i++) {
+      if (i === slotIdx) continue;
+      const vid = comAsgn[comKey(year, month, i)];
+      if (vid) used.add(vid);
+    }
+    return vols.filter((v) => v.roles.includes("Communion") && !used.has(v.id));
+  };
+
+  /* ═══════════ RENDER ═══════════ */
+  if (!loaded) {
+    return (
+      <div style={{ fontFamily: "'Outfit', sans-serif", background: C.bg, minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center" }}>
+        <div style={{ textAlign: "center", color: C.tx2 }}>
+          <div style={{ fontSize: 20, marginBottom: 8 }}>📅</div>
+          <div style={{ fontSize: 14, fontWeight: 500 }}>Загрузка данных...</div>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div style={{ fontFamily: "'Outfit', sans-serif", background: C.bg, minHeight: "100vh", color: C.tx, fontSize: 14 }}>
+      <style>{globalCSS}</style>
+      <div style={{ maxWidth: 1200, margin: "0 auto", padding: "24px 16px" }}>
+
+        {/* HEADER */}
+        <div className="no-print" style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", marginBottom: 24, flexWrap: "wrap", gap: 12 }}>
+          <div>
+            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+              <h1 style={{ fontSize: 24, fontWeight: 700, fontFamily: "'Source Serif 4', serif", letterSpacing: "-0.02em" }}>Расписание</h1>
+              {saveStatus === "saved" && (
+                <span style={{ fontSize: 11, fontWeight: 600, color: C.accent, background: C.accentSoft, padding: "2px 10px", borderRadius: 5, transition: "opacity 0.3s" }}>
+                  ✓ Сохранено
+                </span>
+              )}
+            </div>
+            <p style={{ fontSize: 13, color: C.tx2, marginTop: 3 }}>
+              {MONTHS[month]} {year} · {vols.length} служителей
+              {holidaysThisMonth.length > 0 && ` · ${holidaysThisMonth.length} праздн.`}
+            </p>
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            {canEdit ? (
+              <span style={{ fontSize: 11, fontWeight: 600, color: C.accent, background: C.accentSoft, padding: "3px 10px", borderRadius: 5 }}>
+                Редактирование
+              </span>
+            ) : (
+              <span onClick={() => setShowPinDialog(true)} style={{ fontSize: 11, fontWeight: 600, color: C.tx3, background: C.muted, padding: "3px 10px", borderRadius: 5, cursor: "pointer" }}
+                title="Нажмите для разблокировки редактирования">
+                Только просмотр
+              </span>
+            )}
+            {canEdit && <button
+              onClick={handleResetAll}
+              style={{ background: "none", border: "none", cursor: "pointer", fontSize: 11, color: C.tx3, fontFamily: "inherit", padding: "4px 8px", borderRadius: 6, transition: "color 0.12s" }}
+              title="Сбросить все данные"
+            >
+              ↺ Сброс
+            </button>}
+            <div style={{ display: "flex", gap: 2, background: C.muted, borderRadius: 10, padding: 3 }}>
+            {[["schedule", "📅 Расписание"], ["team", "👥 Команда"], ["availability", "📊 Доступность"]].map(([k, l]) => (
+              <button key={k} onClick={() => setView(k)} style={{
+                padding: "8px 18px", borderRadius: 8, border: "none", cursor: "pointer",
+                fontSize: 13, fontWeight: 500, fontFamily: "inherit",
+                background: view === k ? C.surface : "transparent",
+                color: view === k ? C.tx : C.tx2,
+                boxShadow: view === k ? "0 1px 3px rgba(0,0,0,0.06)" : "none",
+                transition: "all 0.15s",
+              }}>{l}</button>
+            ))}
+            </div>
+          </div>
+        </div>
+
+        {/* ═══════ SCHEDULE ═══════ */}
+        {view === "schedule" && (
+          <div>
+            <div className="no-print" style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 18, flexWrap: "wrap", gap: 10 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                <Btn variant="ghost" small onClick={prevMonth}>◀</Btn>
+                <span style={{ fontSize: 16, fontWeight: 700, minWidth: 150, textAlign: "center", fontFamily: "'Source Serif 4', serif" }}>{MONTHS[month]} {year}</span>
+                <Btn variant="ghost" small onClick={nextMonth}>▶</Btn>
+              </div>
+              <div style={{ display: "flex", gap: 6 }}>
+                {canEdit && <Btn variant="primary" onClick={handleAutoFill}>⚡ Заполнить</Btn>}
+                {canEdit && <Btn onClick={handleClearMonth}>Очистить</Btn>}
+                <Btn onClick={() => setPrintView(true)}>🖨 Печать</Btn>
+                <Btn onClick={handleExport}>📥 Экспорт</Btn>
+                <Btn onClick={handleExportImage}>📷 Картинка</Btn>
+              </div>
+            </div>
+
+            {holidaysThisMonth.length > 0 && (
+              <div style={{ marginBottom: 14, padding: "10px 16px", borderRadius: 10, background: C.holBg, border: `1px solid ${C.holBrd}`, display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+                <span style={{ fontSize: 12, fontWeight: 600, color: C.hol }}>✝ Праздники:</span>
+                {holidaysThisMonth.map((h) => (
+                  <span key={h.dk} style={{ fontSize: 12, color: C.hol, background: `${C.hol}12`, padding: "2px 8px", borderRadius: 5, fontWeight: 500 }}>{h.name} ({ordinal(h.date.getDate())})</span>
+                ))}
+              </div>
+            )}
+
+            {/* COMMUNION CARD */}
+            <Card style={{ marginBottom: 20, border: `1.5px solid ${C.rose}35` }}>
+              <div style={{ padding: "12px 18px", background: `${C.rose}08`, borderBottom: `1px solid ${C.rose}20`, display: "flex", alignItems: "center", gap: 10 }}>
+                <span style={{ fontSize: 18 }}>🍷</span>
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontSize: 15, fontWeight: 700, fontFamily: "'Source Serif 4', serif", color: C.rose }}>Вечеря</div>
+                  <div style={{ fontSize: 11, color: C.tx2 }}>
+                    1-е Воскресенье вечер{firstSunDate ? ` · ${MONTHS[month]} ${ordinal(firstSunDate.getDate())}` : ""} · 5 человек
+                  </div>
+                </div>
+                {communionNames.length === COM_SLOTS && (
+                  <span style={{ fontSize: 11, fontWeight: 600, color: C.accent, background: C.accentSoft, padding: "2px 10px", borderRadius: 5 }}>✓ Все</span>
+                )}
+              </div>
+              <div style={{ padding: 16 }}>
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(180px, 1fr))", gap: 8 }}>
+                  {Array.from({ length: COM_SLOTS }).map((_, i) => {
+                    const person = communionPeople[i];
+                    const available = getComAvailable(i);
+                    return (
+                      <div key={i} style={{
+                        padding: "8px 12px", borderRadius: 8,
+                        border: `1px solid ${person ? C.rose + "30" : C.borderLt}`,
+                        background: person ? C.roseSoft + "90" : C.surface,
+                        display: "flex", alignItems: "center", justifyContent: "space-between",
+                        minHeight: 40, transition: "all 0.12s",
+                      }}>
+                        {person ? (
+                          <React.Fragment>
+                            <div>
+                              <div style={{ fontSize: 10, color: C.rose, fontWeight: 600, marginBottom: 2 }}>Slot {i + 1}</div>
+                              <div style={{ fontSize: 13, fontWeight: 600, color: C.tx }}>{person.name}</div>
+                            </div>
+                            {canEdit && <button className="no-print" onClick={() => onComClear(i)}
+                              style={{ background: "none", border: "none", cursor: "pointer", fontSize: 11, color: C.tx3, padding: "2px 4px" }}>✕</button>}
+                          </React.Fragment>
+                        ) : (
+                          <div style={{ width: "100%" }}>
+                            <div style={{ fontSize: 10, color: C.tx3, fontWeight: 500, marginBottom: 3 }}>Slot {i + 1}</div>
+                            {canEdit ? (
+                              <select className="no-print" value="" onChange={(e) => { if (e.target.value) onComAssign(i, e.target.value); }}
+                                style={{ fontSize: 12, padding: "4px 8px", borderRadius: 6, border: `1px solid ${C.borderLt}`, color: C.tx3, width: "100%", background: C.surface, fontFamily: "inherit", outline: "none", cursor: "pointer" }}>
+                                <option value="">Назначить...</option>
+                                {available.map((v) => <option key={v.id} value={v.id}>{v.name}</option>)}
+                              </select>
+                            ) : (
+                              <div style={{ fontSize: 12, fontStyle: "italic", color: C.tx3 }}>— Свободно —</div>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            </Card>
+
+            {/* WEEKS */}
+            {weeks.map((week, wi) => {
+              const entries = [];
+              Object.values(week.days).forEach(({ date, services }) => {
+                services.forEach((svc) => entries.push({ date, dk: dateFmt(date), svc }));
+              });
+              return (
+                <div key={week.wk} className="fade-in print-break" style={{ marginBottom: 22, animationDelay: `${wi * 50}ms` }}>
+                  <div style={{ fontSize: 11, fontWeight: 600, color: C.tx3, textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 8, paddingLeft: 4 }}>Неделя {wi + 1}</div>
+                  <div style={{ display: "grid", gridTemplateColumns: `repeat(${Math.min(entries.length, 3)}, 1fr)`, gap: 10 }}>
+                    {entries.map(({ date, dk, svc }) => {
+                      const holiday = HOLIDAYS[dk];
+                      const isCommunion = dk === firstSunDk && svc === "Sunday PM";
+                      return (
+                        <Card key={`${dk}-${svc}`} isHoliday={!!holiday}>
+                          <div style={{
+                            padding: "10px 14px", background: holiday ? `${C.hol}0C` : C.bg,
+                            borderBottom: `1px solid ${holiday ? C.holBrd : C.border}`,
+                            display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap",
+                          }}>
+                            <span style={{ fontSize: 15, fontWeight: 700, fontFamily: "'Source Serif 4', serif", color: holiday ? C.hol : C.tx }}>{date.getDate()}</span>
+                            <span style={{ fontSize: 12, fontWeight: 500, color: C.tx2 }}>{svc}</span>
+                            {holiday && (
+                              <span style={{ padding: "2px 8px", borderRadius: 6, background: `${C.hol}18`, color: C.hol, fontSize: 10, fontWeight: 700 }}>✝ {holiday}</span>
+                            )}
+                            {isCommunion && (
+                              <span style={{ fontSize: 10, fontWeight: 700, color: C.rose, background: C.roseSoft, padding: "2px 8px", borderRadius: 5 }}>🍷 Вечеря</span>
+                            )}
+                          </div>
+                          <div style={{ padding: 10, display: "flex", flexDirection: "column", gap: 5 }}>
+                            {(ROLES_FOR_SERVICE[svc] || MAIN_ROLES).map((role) => {
+                              const isOpt = isOptionalRole(role, svc);
+                              if (isOpt && !isOptEnabled(dk, svc, role)) {
+                                if (!canEdit) return null;
+                                return (
+                                  <div key={role} className="no-print" style={{ padding: "4px 8px", borderRadius: 7, border: `1px dashed ${C.borderLt}`, display: "flex", alignItems: "center", justifyContent: "space-between", opacity: 0.45 }}>
+                                    <span style={{ fontSize: 11, color: C.tx3 }}>{rl(role)}</span>
+                                    <button onClick={() => toggleOptional(dk, svc, role)} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 11, color: C.accent, fontFamily: "inherit", fontWeight: 500 }}>+ Доб.</button>
+                                  </div>
+                                );
+                              }
+                              return (
+                                <div key={role} style={{ position: "relative" }}>
+                                  {canEdit && isOpt && (
+                                    <button className="no-print" onClick={() => toggleOptional(dk, svc, role)}
+                                      style={{ position: "absolute", top: 2, right: 4, background: "none", border: "none", cursor: "pointer", fontSize: 9, color: C.tx3, zIndex: 1 }}>✕</button>
+                                  )}
+                                  <RoleSlot dateKey={dk} svc={svc} role={role} assignments={asgn} volunteers={vols} unavailability={unavail} onAssign={onAssign} onClear={onClear} canEdit={canEdit} topics={topics} onTopicChange={onTopicChange} />
+                                </div>
+                              );
+                            })}
+                            {isCommunion && communionNames.length > 0 && (
+                              <div style={{ marginTop: 4, padding: "8px 10px", borderRadius: 8, background: `${C.rose}08`, border: `1px solid ${C.rose}18` }}>
+                                <div style={{ fontSize: 10, fontWeight: 700, color: C.rose, marginBottom: 4 }}>🍷 Вечеря</div>
+                                <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+                                  {communionPeople.map((person, i) => (
+                                    <div key={i} style={{
+                                      fontSize: 12, fontWeight: person ? 600 : 400,
+                                      color: person ? C.tx : C.tx3, padding: "2px 6px", borderRadius: 5,
+                                      background: person ? C.roseSoft + "80" : "transparent",
+                                    }}>
+                                      {person ? person.name : `Место ${i + 1} — свободно`}
+                                    </div>
+                                  ))}
+                                </div>
+                              </div>
+                            )}
+                          </div>
+                        </Card>
+                      );
+                    })}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+
+        {/* ═══════ TEAM ═══════ */}
+        {view === "team" && (
+          <div>
+            <div style={{ marginBottom: 16, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <h2 style={{ fontSize: 18, fontWeight: 700, fontFamily: "'Source Serif 4', serif" }}>Команда</h2>
+              {canEdit && <Btn variant="primary" onClick={() => { setEditVol(null); setShowModal(true); }}>+ Доб. Volunteer</Btn>}
+            </div>
+            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+              {vols.map((v, i) => (
+                <Card key={v.id} className="fade-in" style={{ animationDelay: `${i * 30}ms` }}>
+                  <div style={{ padding: "14px 18px", display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 12 }}>
+                    <div style={{ flex: 1 }}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 8 }}>
+                        <span style={{ fontSize: 15, fontWeight: 700 }}>{v.name}</span>
+                        <span style={{ fontSize: 11, fontWeight: 500, color: C.tx3, background: C.muted, padding: "1px 8px", borderRadius: 4 }}>{volCounts[v.id] || 0} назн.</span>
+                      </div>
+                      <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                        <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+                          <span style={{ fontSize: 11, fontWeight: 600, color: C.tx2, minWidth: 55 }}>Роли:</span>
+                          {v.roles.map((r) => <RoleBadge key={r} role={r} small />)}
+                        </div>
+                        <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+                          <span style={{ fontSize: 11, fontWeight: 600, color: C.tx2, minWidth: 55 }}>Служения:</span>
+                          {v.services.map((s) => <span key={s} style={{ fontSize: 11, fontWeight: 500, padding: "1px 7px", borderRadius: 4, background: C.muted, color: C.tx2 }}>{s}</span>)}
+                        </div>
+                      </div>
+                    </div>
+                    {canEdit && <div style={{ display: "flex", gap: 4 }}>
+                      <Btn variant="ghost" small onClick={() => { setEditVol(v); setShowModal(true); }}>✏️</Btn>
+                      <Btn variant="ghost" small onClick={() => deleteVolunteer(v.id)}>🗑</Btn>
+                    </div>}
+                  </div>
+                </Card>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* ═══════ AVAILABILITY ═══════ */}
+        {view === "availability" && (
+          <div>
+            <div className="no-print" style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 16 }}>
+              <Btn variant="ghost" small onClick={prevMonth}>◀</Btn>
+              <span style={{ fontSize: 16, fontWeight: 700, minWidth: 150, textAlign: "center", fontFamily: "'Source Serif 4', serif" }}>{MONTHS[month]} {year}</span>
+              <Btn variant="ghost" small onClick={nextMonth}>▶</Btn>
+            </div>
+            <Card>
+              <div style={{ padding: "14px 18px", borderBottom: `1px solid ${C.border}` }}>
+                <h3 style={{ fontSize: 15, fontWeight: 700, fontFamily: "'Source Serif 4', serif" }}>Доступность</h3>
+                <p style={{ fontSize: 12, color: C.tx2, marginTop: 2 }}>Нажмите для переключения. Красный = недоступен.</p>
+              </div>
+              <div style={{ overflowX: "auto", padding: "0 0 8px" }}>
+                <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
+                  <thead>
+                    <tr>
+                      <th style={{ padding: "10px 14px", textAlign: "left", borderBottom: `2px solid ${C.border}`, position: "sticky", left: 0, background: C.surface, zIndex: 2, minWidth: 130 }}>Имя</th>
+                      {uniqueDates.map((sd) => {
+                        const holiday = HOLIDAYS[sd.dk];
+                        return (
+                          <th key={sd.dk} style={{ padding: "8px 4px", textAlign: "center", borderBottom: `2px solid ${holiday ? C.holBrd : C.border}`, whiteSpace: "nowrap", minWidth: 42, background: holiday ? C.holBg : "transparent" }}>
+                            <div style={{ fontWeight: 600, color: holiday ? C.hol : C.tx }}>{DAYNAMES[sd.date.getDay()]}</div>
+                            <div style={{ fontWeight: 400, color: holiday ? C.hol : C.tx2, fontSize: 11 }}>{sd.date.getDate()}</div>
+                            {holiday && <div style={{ fontSize: 8, color: C.hol, fontWeight: 600, marginTop: 2 }}>✝</div>}
+                          </th>
+                        );
+                      })}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {vols.map((v) => (
+                      <tr key={v.id}>
+                        <td style={{ padding: "8px 14px", borderBottom: `1px solid ${C.borderLt}`, fontWeight: 600, position: "sticky", left: 0, background: C.surface, zIndex: 1, whiteSpace: "nowrap" }}>{v.name}</td>
+                        {uniqueDates.map((sd) => {
+                          const isU = !!unavail[`${v.id}|${sd.dk}`];
+                          const holiday = HOLIDAYS[sd.dk];
+                          return (
+                            <td key={sd.dk} style={{ padding: 3, textAlign: "center", borderBottom: `1px solid ${C.borderLt}`, background: holiday ? C.holBg : "transparent" }}>
+                              <button onClick={() => setUnavail((p) => ({ ...p, [`${v.id}|${sd.dk}`]: !p[`${v.id}|${sd.dk}`] }))}
+                                style={{ width: 32, height: 28, borderRadius: 6, border: "none", cursor: "pointer", background: isU ? C.dangerSoft : holiday ? `${C.hol}10` : C.bg, color: isU ? C.danger : "#bbb", fontWeight: 700, fontSize: 12, transition: "all 0.1s" }}>
+                                {isU ? "✕" : "✓"}
+                              </button>
+                            </td>
+                          );
+                        })}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </Card>
+          </div>
+        )}
+      </div>
+
+      {/* ═══════ PRINT VIEW ═══════ */}
+      {printView && (
+        <div style={{ position: "fixed", inset: 0, background: "#fff", zIndex: 2000, overflow: "auto", padding: "24px 20px" }}>
+          <div style={{ maxWidth: 900, margin: "0 auto" }}>
+            <div className="no-print" style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20, borderBottom: `2px solid ${C.tx}`, paddingBottom: 12 }}>
+              <div>
+                <h1 style={{ fontSize: 22, fontWeight: 700, fontFamily: "'Source Serif 4', serif", margin: 0 }}>
+                  {MONTHS[month]} {year} — Расписание
+                </h1>
+                <p style={{ fontSize: 12, color: C.tx2, margin: "4px 0 0" }}>{vols.length} служителей</p>
+              </div>
+              <button
+                onClick={() => setPrintView(false)}
+                style={{ padding: "8px 20px", borderRadius: 8, border: `1px solid ${C.border}`, background: C.muted, cursor: "pointer", fontSize: 13, fontWeight: 500, fontFamily: "'Outfit', sans-serif" }}
+              >
+                ✕ Закрыть
+              </button>
+            </div>
+            <PrintContent month={month} year={year} vols={vols} weeks={weeks} asgn={asgn} optTog={optTog}
+              firstSunDk={firstSunDk} firstSunDate={firstSunDate} communionPeople={communionPeople} communionNames={communionNames} topics={topics} />
+            <div style={{ marginTop: 24, textAlign: "center", color: C.tx3, fontSize: 11 }}>
+              Совет: Используйте Ctrl+P / Cmd+P для печати
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Hidden off-screen div for image export */}
+      {exporting && (
+        <div ref={exportRef} style={{ position: "absolute", left: -9999, top: 0, width: 440, background: "#fff", padding: "20px 16px", fontFamily: "'Outfit', sans-serif" }}>
+          <PrintContent month={month} year={year} vols={vols} weeks={weeks} asgn={asgn} optTog={optTog}
+            firstSunDk={firstSunDk} firstSunDate={firstSunDate} communionPeople={communionPeople} communionNames={communionNames} singleColumn topics={topics} />
+        </div>
+      )}
+
+      {canEdit && showModal && (
+        <VolunteerModal volunteer={editVol} onSave={saveVolunteer} onClose={() => { setShowModal(false); setEditVol(null); }} />
+      )}
+
+      {/* ═══════ UNLOCK PIN DIALOG ═══════ */}
+      {showPinDialog && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.35)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1000, padding: 20 }} onClick={() => setShowPinDialog(false)}>
+          <div className="modal-in" onClick={(e) => e.stopPropagation()} style={{ background: C.surface, borderRadius: 16, width: 340, padding: 24, boxShadow: "0 20px 60px rgba(0,0,0,0.15)", fontFamily: "'Outfit', sans-serif" }}>
+            <h3 style={{ fontSize: 17, fontWeight: 700, marginBottom: 16, fontFamily: "'Source Serif 4', serif" }}>Разблокировать</h3>
+            <input value={pinInput} onChange={(e) => { setPinInput(e.target.value); setPinError(false); }}
+              onKeyDown={(e) => e.key === "Enter" && handlePinSubmit()}
+              placeholder="Введите ключ..."
+              type="password" autoFocus
+              style={{ padding: "9px 12px", borderRadius: 8, border: `1px solid ${pinError ? C.danger : C.border}`, fontSize: 13, fontFamily: "inherit", outline: "none", width: "100%", marginBottom: 12, boxSizing: "border-box" }} />
+            {pinError && <div style={{ color: C.danger, fontSize: 12, marginBottom: 8 }}>Неверный ключ</div>}
+            <div style={{ display: "flex", justifyContent: "flex-end", gap: 8 }}>
+              <Btn variant="ghost" onClick={() => { setShowPinDialog(false); setPinInput(""); setPinError(false); }}>Отмена</Btn>
+              <Btn variant="primary" onClick={handlePinSubmit}>Войти</Btn>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+
+ReactDOM.createRoot(document.getElementById("root")).render(<ChurchScheduleBuilder />);
+</script>
+</body>
+</html>
