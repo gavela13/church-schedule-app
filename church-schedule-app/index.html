@@ -798,8 +798,8 @@ function ChurchScheduleBuilder() {
   const [optTog, setOptTog] = useState(MARCH_OPT);
   const [unavail, setUnavail] = useState({});
   const [topics, setTopics] = useState({});
-  const [month, setMonth] = useState(2); // March
-  const [year, setYear] = useState(2026);
+  const [month, setMonth] = useState(new Date().getMonth());
+  const [year, setYear] = useState(new Date().getFullYear());
   const [showModal, setShowModal] = useState(false);
   const [editVol, setEditVol] = useState(null);
   const [initialized, setInitialized] = useState(true);
