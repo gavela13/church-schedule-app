@@ -476,7 +476,7 @@ function RoleSlot({ dateKey: dk, svc, role, assignments, volunteers, unavailabil
         <React.Fragment>
           <div draggable={canEdit} onDragStart={canEdit ? (e) => e.dataTransfer.setData("text/plain", JSON.stringify({ vid: vol.id, fromKey: key })) : undefined}
             style={{ fontSize: 12, fontWeight: 600, color: C.tx, cursor: canEdit ? "grab" : "default", padding: "1px 0", userSelect: "none" }}>{vol.name}</div>
-          {role === "Preacher" && svc === "Sunday AM" && (
+          {role.includes("Preacher") && (
             canEdit ? (
               <input
                 className="no-print"
@@ -758,7 +758,7 @@ function PrintContent({ month, year, vols, weeks, asgn, optTog, firstSunDk, firs
                             }}>
                               {isNoneVal ? "—" : person ? person.name : "⚠ Пусто"}
                             </span>
-                            {role === "Preacher" && svc === "Sunday AM" && topics && topics[slotKey(d, svc, role)] && (
+                            {role.includes("Preacher") && topics && topics[slotKey(d, svc, role)] && (
                               <span style={{ fontSize: sc ? 8 : 10, color: C.tx2, fontStyle: "italic" }}>
                                 — {topics[slotKey(d, svc, role)]}
                               </span>
